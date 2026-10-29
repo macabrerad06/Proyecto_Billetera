@@ -8,36 +8,16 @@ const path = require('path');
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const DB_FILE = path.join(__dirname, 'usuarios_db.json');
 
-// Base de datos inicial con 2 cuentas reales para que puedas probar de inmediato
-const datosIniciales = {
-    usuarios: [
-        {
-            cuenta: "2200112233",
-            usuario: "marco",
-            pin: "1234",
-            nombre: "Marco Cabrera",
-            saldo: 1250.00
-        },
-        {
-            cuenta: "2200998877",
-            usuario: "carlos",
-            pin: "1234",
-            nombre: "Carlos Andrade (Docente)",
-            saldo: 800.00
-        }
-    ]
-};
-
+// Base de datos 100% limpia (sin cuentas pre-creadas)
 function leerDB() {
     if (!fs.existsSync(DB_FILE)) {
-        fs.writeFileSync(DB_FILE, JSON.stringify(datosIniciales, null, 2));
+        fs.writeFileSync(DB_FILE, JSON.stringify({ usuarios: [] }, null, 2));
     }
     return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 }
@@ -46,34 +26,20 @@ function guardarDB(data) {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// Mapa de conexiones WebSocket por número de cuenta
-const clientesConectados = new Map();
-
 wss.on('connection', (ws) => {
-    let cuentaAsociada = null;
-
-    ws.on('message', ( msg ) => {
+    ws.on('message', (msg) => {
         try {
             const data = JSON.parse(msg);
             if (data.tipo === 'SUSCRIBIR' && data.cuenta) {
-                cuentaAsociada = data.cuenta;
-                clientesConectados.set(cuentaAsociada, ws);
-                console.log(`📱 [WS] Cuenta ${cuentaAsociada} en línea`);
+                ws.cuentaAsociada = data.cuenta;
+                console.log(`[WS] Celular conectado -> Cuenta: ${data.cuenta}`);
             }
         } catch (e) {}
     });
-
-    ws.on('close', () => {
-        if (cuentaAsociada) {
-            clientesConectados.delete(cuentaAsociada);
-            console.log(`📴 [WS] Cuenta ${cuentaAsociada} desconectada`);
-        }
-    });
 });
 
-function notificarCuentaEnVivo(cuentaDestino, payload) {
+function notificarAppAndroid( payload ) {
     const msg = JSON.stringify(payload);
-    // Enviar al dueño de la cuenta y a los clientes activos
     wss.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
             client.send(msg);
@@ -81,215 +47,152 @@ function notificarCuentaEnVivo(cuentaDestino, payload) {
     });
 }
 
-// 1. REGISTRO DE NUEVO USUARIO
+// 1. REGISTRO DE NUEVA CUENTA DESDE LA APP ANDROID
 app.post('/api/registro', (req, res) => {
-    const { nombre, usuario, pin, saldoInicial } = req.body;
+    const { nombre, usuario, pin, saldoInicial } = req.body || {};
     if (!nombre || !usuario || !pin) {
         return res.status(400).json({ error: 'Completa todos los campos' });
     }
 
     const db = leerDB();
-    if (db.usuarios.find(u => u.usuario.toLowerCase() === usuario.toLowerCase())) {
-        return res.status(400).json({ error: 'Ese nombre de usuario ya existe' });
+    if (db.usuarios.find(u => u.usuario.toLowerCase() === usuario.trim().toLowerCase())) {
+        return res.status(400).json({ error: 'Ese usuario ya está registrado' });
     }
 
-    // Generar número de cuenta bancario único de 10 dígitos (empieza con 2200)
     const nuevaCuenta = "2200" + Math.floor(100000 + Math.random() * 900000).toString();
     const nuevoUsuario = {
         cuenta: nuevaCuenta,
         usuario: usuario.trim(),
         pin: pin.trim(),
         nombre: nombre.trim(),
-        saldo: parseFloat(saldoInicial) || 500.00
+        saldo: parseFloat(saldoInicial) || 0.00
     };
 
     db.usuarios.push(nuevoUsuario);
     guardarDB(db);
 
-    console.log(`✅ Nueva cuenta creada: ${nuevoUsuario.nombre} -> Nro: ${nuevaCuenta}`);
+    console.log(`[REGISTRO] Titular: ${nuevoUsuario.nombre} | Cta: ${nuevaCuenta}`);
     res.json({ status: 'OK', usuario: nuevoUsuario });
 });
 
-// 2. LOGIN DE USUARIO (Por usuario o por número de cuenta)
+// 2. LOGIN DESDE LA APP ANDROID
 app.post('/api/login', (req, res) => {
-    const { identificador, pin } = req.body;
+    const { identificador, pin } = req.body || {};
     const db = leerDB();
 
     const user = db.usuarios.find(
-        u => (u.usuario.toLowerCase() === (identificador || '').toLowerCase() || u.cuenta === identificador) && u.pin === pin
+        u => (u.usuario.toLowerCase() === (identificador || '').trim().toLowerCase() || u.cuenta === (identificador || '').trim()) && u.pin === (pin || '').trim()
     );
 
-    if (!user) {
-        return res.status(401).json({ error: 'Usuario/Cuenta o PIN incorrectos' });
-    }
-
+    if (!user) return res.status(401).json({ error: 'Credenciales incorrectas' });
     res.json({ status: 'OK', usuario: user });
 });
 
-// 3. CONSULTAR SI UNA CUENTA EXISTE (Para validar antes de transferir)
+// 3. VERIFICAR SI LA CUENTA EXISTE ANTES DE ENVIAR DINERO
 app.get('/api/cuenta/:numero', (req, res) => {
     const db = leerDB();
     const user = db.usuarios.find(u => u.cuenta === req.params.numero);
-    if (!user) {
-        return res.status(404).json({ existe: false, error: 'La cuenta ingresada no existe' });
-    }
+    if (!user) return res.status(404).json({ existe: false, error: 'Cuenta no existe' });
     res.json({ existe: true, cuenta: user.cuenta, nombre: user.nombre });
 });
 
-// 4. LISTAR DIRECTORIO DE CUENTAS EXISTENTES (Para ver fácilmente a quién transferir)
+// 4. LISTAR CUENTAS REGISTRADAS (Para poder ver en la app qué cuentas has creado)
 app.get('/api/cuentas', (req, res) => {
     const db = leerDB();
-    const lista = db.usuarios.map(u => ({ cuenta: u.cuenta, nombre: u.nombre, usuario: u.usuario }));
-    res.json(lista);
+    res.json(db.usuarios.map(u => ({ cuenta: u.cuenta, nombre: u.nombre, usuario: u.usuario })));
 });
 
-// 5. DEPÓSITO (REST)
+// 5. DEPÓSITO
 app.post('/api/deposito', (req, res) => {
-    const { cuenta, monto, comentario } = req.body;
+    const { cuenta, monto } = req.body || {};
     const valor = parseFloat(monto);
-    if (!valor || valor <= 0) return res.status(400).json({ error: 'Monto inválido' });
-
     const db = leerDB();
     const user = db.usuarios.find(u => u.cuenta === cuenta);
-    if (!user) return res.status(404).json({ error: 'Cuenta no encontrada' });
+    if (!user || !valor || valor <= 0) return res.status(400).json({ error: 'Datos inválidos' });
 
     user.saldo += valor;
     guardarDB(db);
-
-    res.json({
-        status: 'OK',
-        saldo: user.saldo,
-        mensaje: 'Depósito acreditado',
-        detalle: comentario || 'Recarga en línea'
-    });
+    res.json({ status: 'OK', saldo: user.saldo, mensaje: 'Depósito realizado' });
 });
 
-// 6. RETIRO (REST)
+// 6. RETIRO
 app.post('/api/retiro', (req, res) => {
-    const { cuenta, monto, comentario } = req.body;
+    const { cuenta, monto } = req.body || {};
     const valor = parseFloat(monto);
-    if (!valor || valor <= 0) return res.status(400).json({ error: 'Monto inválido' });
-
     const db = leerDB();
     const user = db.usuarios.find(u => u.cuenta === cuenta);
-    if (!user) return res.status(404).json({ error: 'Cuenta no encontrada' });
-    if (valor > user.saldo) return res.status(400).json({ error: 'Fondos insuficientes en tu cuenta' });
+    if (!user || !valor || valor <= 0) return res.status(400).json({ error: 'Datos inválidos' });
+    if (valor > user.saldo) return res.status(400).json({ error: 'Fondos insuficientes' });
 
     user.saldo -= valor;
     guardarDB(db);
-
-    res.json({
-        status: 'OK',
-        saldo: user.saldo,
-        mensaje: 'Retiro exitoso',
-        detalle: comentario || 'Retiro sin tarjeta'
-    });
+    res.json({ status: 'OK', saldo: user.saldo, mensaje: 'Retiro realizado' });
 });
 
-// 7. PAGO DE SERVICIOS BÁSICOS (REST)
+// 7. PAGO DE SERVICIOS BÁSICOS
 app.post('/api/servicios', (req, res) => {
-    const { cuenta, monto, contrato, comentario } = req.body;
+    const { cuenta, monto } = req.body || {};
     const valor = parseFloat(monto);
-    if (!valor || valor <= 0) return res.status(400).json({ error: 'Monto inválido' });
-
     const db = leerDB();
     const user = db.usuarios.find(u => u.cuenta === cuenta);
-    if (!user) return res.status(404).json({ error: 'Cuenta no encontrada' });
-    if (valor > user.saldo) return res.status(400).json({ error: 'Fondos insuficientes para pagar el servicio' });
+    if (!user || !valor || valor <= 0) return res.status(400).json({ error: 'Datos inválidos' });
+    if (valor > user.saldo) return res.status(400).json({ error: 'Fondos insuficientes' });
 
     user.saldo -= valor;
     guardarDB(db);
-
-    res.json({
-        status: 'OK',
-        saldo: user.saldo,
-        mensaje: 'Servicio Básico Pagado',
-        detalle: `Contrato: ${contrato || 'S/N'} ${comentario ? '• ' + comentario : ''}`
-    });
+    res.json({ status: 'OK', saldo: user.saldo, mensaje: 'Servicio pagado' });
 });
 
-// 8. TRANSFERENCIA P2P CON VALIDACIÓN ESTRICTA DE CUENTA + COMENTARIOS + WEBSOCKET
+// 8. TRANSFERENCIA P2P (Desde App Android o desde Postman)
 app.post('/api/transferir', (req, res) => {
-    const { cuentaOrigen, cuentaDestino, monto, comentario, nombreEmisorExterno } = req.body;
+    const { cuentaOrigen, cuentaDestino, monto, comentario } = req.body || {};
     const valor = parseFloat(monto);
 
-    if (!valor || valor <= 0) return res.status(400).json({ error: 'El monto debe ser mayor a $0.00' });
-    if (!cuentaDestino) return res.status(400).json({ error: 'Debes indicar la cuentaDestino' });
+    if (!valor || valor <= 0) return res.status(400).json({ error: 'Monto inválido' });
+    if (!cuentaDestino) return res.status(400).json({ error: 'Falta cuentaDestino' });
 
     const db = leerDB();
     const receptor = db.usuarios.find(u => u.cuenta === cuentaDestino);
+    if (!receptor) return res.status(404).json({ error: 'La cuenta destino NO existe' });
 
-    // VALIDACIÓN ESTRICTA: Si la cuenta destino NO existe, rechazar inmediatamente
-    if (!receptor) {
-        return res.status(404).json({
-            error: `La cuenta destino Nro. ${cuentaDestino} NO existe en el banco. Verifique el número.`
-        });
-    }
+    let nombreEmisor = "Transferencia Postman";
+    let ctaEmisor = cuentaOrigen || "EXTERNO";
+    let saldoRespuesta = receptor.saldo;
 
-    let emisorNombre = nombreEmisorExterno || "Transferencia Externa (Postman)";
-    let emisorCuenta = cuentaOrigen || "EXTERNO-POSTMAN";
-    let saldoEmisorActualizado = null;
-
-    // Si viene desde una cuenta registrada en la App (cuentaOrigen)
     if (cuentaOrigen) {
-        if (cuentaOrigen === cuentaDestino) {
-            return res.status(400).json({ error: 'No puedes transferir dinero a tu propia cuenta' });
-        }
+        if (cuentaOrigen === cuentaDestino) return res.status(400).json({ error: 'Misma cuenta' });
         const emisor = db.usuarios.find(u => u.cuenta === cuentaOrigen);
-        if (!emisor) {
-            return res.status(404).json({ error: 'La cuenta de origen no existe' });
-        }
-        if (valor > emisor.saldo) {
-            return res.status(400).json({ error: 'Fondos insuficientes para realizar la transferencia' });
-        }
+        if (!emisor) return res.status(404).json({ error: 'Cuenta origen no existe' });
+        if (valor > emisor.saldo) return res.status(400).json({ error: 'Fondos insuficientes' });
 
         emisor.saldo -= valor;
-        emisorNombre = emisor.nombre;
-        emisorCuenta = emisor.cuenta;
-        saldoEmisorActualizado = emisor.saldo;
+        nombreEmisor = emisor.nombre;
+        ctaEmisor = emisor.cuenta;
+        saldoRespuesta = emisor.saldo;
     }
 
-    // Sumar saldo al receptor
     receptor.saldo += valor;
     guardarDB(db);
 
-    const motivoTxt = comentario ? `"${comentario}"` : 'Sin comentario';
-    const horaActual = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-    console.log(`💸 [P2P] De: ${emisorNombre} (${emisorCuenta}) -> Para: ${receptor.nombre} (${receptor.cuenta}) | $${valor.toFixed(2)} | ${motivoTxt}`);
-
-    // Notificar en TIEMPO REAL por WebSocket al celular que tiene esa cuenta abierta
-    notificarCuentaEnVivo(receptor.cuenta, {
+    notificarAppAndroid({
         tipo: 'TRANSFERENCIA_RECIBIDA',
         cuentaDestino: receptor.cuenta,
-        nombreReceptor: receptor.nombre,
-        nombreEmisor: emisorNombre,
-        cuentaEmisor: emisorCuenta,
+        nombreEmisor: nombreEmisor,
+        cuentaEmisor: ctaEmisor,
         monto: valor,
         saldoNuevo: receptor.saldo,
-        comentario: comentario || 'Transferencia directa',
-        detalleCompleto: `De: ${emisorNombre} (Cta. ${emisorCuenta}) • Motivo: ${comentario || 'Transferencia P2P'}`,
-        fecha: horaActual
+        comentario: comentario || 'Transferencia P2P'
     });
 
     res.json({
         status: 'OK',
-        saldo: saldoEmisorActualizado !== null ? saldoEmisorActualizado : receptor.saldo,
-        destinatario: {
-            nombre: receptor.nombre,
-            cuenta: receptor.cuenta
-        },
+        saldo: saldoRespuesta,
+        destinatario: { nombre: receptor.nombre, cuenta: receptor.cuenta },
         comentario: comentario || 'Transferencia P2P',
-        mensaje: `Transferencia exitosa a ${receptor.nombre} (Cta. ${receptor.cuenta})`
+        mensaje: `Transferencia enviada a ${receptor.nombre}`
     });
 });
 
-const PORT = 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    console.log('===========================================================');
-    console.log(`🏦 BANCA DISTRIBUIDA ACTIVA EN PUERTO ${PORT}`);
-    console.log(`📋 Cuentas pre-creadas para pruebas:`);
-    console.log(`   1) Cuenta: 2200112233 | Usuario: marco  | PIN: 1234`);
-    console.log(`   2) Cuenta: 2200998877 | Usuario: carlos | PIN: 1234`);
-    console.log('===========================================================');
+server.listen(3000, '0.0.0.0', () => {
+    console.log('Servidor corriendo en puerto 3000');
 });
